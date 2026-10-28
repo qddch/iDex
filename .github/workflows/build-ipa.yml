@@ -1,10 +1,9 @@
 # ============================================================
-# iDex 云端编译流水线 —— 在 GitHub 的 macOS 机器上编出 .ipa
+# iDex 云端编译流水线 v2 —— 在 GitHub 的 macOS 机器上编出 .ipa
 #
-# 用法：把这个文件放到你 Fork 出来的仓库里，路径必须正好是
-#       .github/workflows/build-ipa.yml
-# 然后在仓库的 Actions 页面点 “Build iDex IPA” → Run workflow。
-# 跑完在页面底部下载 iDex-unsigned-ipa 这个 artifact。
+# v1 的 run #1 结果：镜像 xcode-27 ✓、Xcode 27.1 ✓、iOS 27 SDK ✓、xcodebuild -list ✓
+# 只有「编译」那一步秒退 exit code 64（= xcodebuild 的 usage 错误，不是编译报错）。
+# v2 改动：去掉命令续行符、把 -sdk 从必选改成可退让、并把编译拆成三次尝试。
 # ============================================================
 name: Build iDex IPA
 
@@ -16,7 +15,6 @@ jobs:
     # 关键：必须用这个 preview 镜像。截止 2026-10，GitHub 的正式镜像
     # （macos-latest / macos-26）最高只到 Xcode 26.6，编不了 iOS 27；
     # xcode-27 镜像（macOS 27.0.1 arm64）默认就带 Xcode 27.1 + iphoneos27.1 SDK。
-    # 如果这个 label 哪天消失，见安装指南第 9 节的备选方案。
     runs-on: xcode-27
     timeout-minutes: 45
 
@@ -34,6 +32,8 @@ jobs:
             sudo xcode-select -s /Applications/Xcode_27.1.app
           fi
           xcodebuild -version
+          echo "xcode-select -p = $(xcode-select -p)"
+          echo "which xcodebuild = $(command -v xcodebuild)"
           SDKVER=$(xcodebuild -showsdks | sed -n 's/.*-sdk iphoneos\([0-9][0-9.]*\).*/\1/p' | tail -1)
           echo "iPhoneOS SDK = ${SDKVER:-<无>}"
           if [ -z "${SDKVER:-}" ] || [ "${SDKVER%%.*}" -lt 27 ]; then
@@ -49,16 +49,24 @@ jobs:
         # 全新 clone 出来的机器上 -scheme iDex 会报 scheme not found。
         run: |
           set -euo pipefail
-          xcodebuild build \
-            -project iDex.xcodeproj \
-            -target iDex \
-            -configuration Release \
-            -sdk iphoneos \
-            -derivedDataPath "$RUNNER_TEMP/dd" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_ENTITLEMENTS=""
+          DD="$RUNNER_TEMP/dd"
+
+          echo "=== 尝试 1：-target，不显式指定 -sdk（沿用工程里的 SDKROOT=iphoneos）==="
+          if xcodebuild -project iDex.xcodeproj -target iDex -configuration Release -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build; then
+            echo "BUILD_OK attempt=1"; exit 0
+          fi
+
+          echo "=== 尝试 2：-target + 显式 -sdk iphoneos ==="
+          if xcodebuild -project iDex.xcodeproj -target iDex -configuration Release -sdk iphoneos -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build; then
+            echo "BUILD_OK attempt=2"; exit 0
+          fi
+
+          echo "=== 尝试 3：现场生成共享 scheme，改用 -scheme + -destination ==="
+          SCHEME_DIR=iDex.xcodeproj/xcshareddata/xcschemes
+          mkdir -p "$SCHEME_DIR"
+          printf '%s' '<?xml version="1.0" encoding="UTF-8"?><Scheme LastUpgradeVersion="2710" version="1.7"><BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES"><BuildActionEntries><BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES"><BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="007BF022308C7972002CDCE2" BuildableName="iDex.app" BlueprintName="iDex" ReferencedContainer="container:iDex.xcodeproj"/></BuildActionEntry></BuildActionEntries></BuildAction></Scheme>' > "$SCHEME_DIR/iDex.xcscheme"
+          xcodebuild -project iDex.xcodeproj -scheme iDex -configuration Release -destination 'generic/platform=iOS' -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+          echo "BUILD_OK attempt=3"
 
       - name: 打包成 .ipa
         run: |
