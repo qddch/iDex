@@ -1,0 +1,84 @@
+# ============================================================
+# iDex 云端编译流水线 —— 在 GitHub 的 macOS 机器上编出 .ipa
+#
+# 用法：把这个文件放到你 Fork 出来的仓库里，路径必须正好是
+#       .github/workflows/build-ipa.yml
+# 然后在仓库的 Actions 页面点 “Build iDex IPA” → Run workflow。
+# 跑完在页面底部下载 iDex-unsigned-ipa 这个 artifact。
+# ============================================================
+name: Build iDex IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 关键：必须用这个 preview 镜像。截止 2026-10，GitHub 的正式镜像
+    # （macos-latest / macos-26）最高只到 Xcode 26.6，编不了 iOS 27；
+    # xcode-27 镜像（macOS 27.0.1 arm64）默认就带 Xcode 27.1 + iphoneos27.1 SDK。
+    # 如果这个 label 哪天消失，见安装指南第 9 节的备选方案。
+    runs-on: xcode-27
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 列出镜像里自带的 Xcode
+        run: ls -1 /Applications | grep '^Xcode' || true
+
+      - name: 选一个带 iOS 27 SDK 的 Xcode
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_27.1.app ]; then
+            sudo xcode-select -s /Applications/Xcode_27.1.app
+          fi
+          xcodebuild -version
+          SDKVER=$(xcodebuild -showsdks | sed -n 's/.*-sdk iphoneos\([0-9][0-9.]*\).*/\1/p' | tail -1)
+          echo "iPhoneOS SDK = ${SDKVER:-<无>}"
+          if [ -z "${SDKVER:-}" ] || [ "${SDKVER%%.*}" -lt 27 ]; then
+            echo "::error::这个运行器上最高只有 iOS ${SDKVER:-?} SDK，而 iDex 要用 iOS 27 SDK 编译。请改用装有 Xcode 27.1 的 Mac（自己的或云端租的），或者向作者索要 TestFlight 构建。"
+            exit 1
+          fi
+
+      - name: 看清工程结构
+        run: xcodebuild -list -project iDex.xcodeproj
+
+      - name: 编译（不签名）
+        # 用 -target 而不是 README 里的 -scheme：作者没有提交共享 scheme 文件，
+        # 全新 clone 出来的机器上 -scheme iDex 会报 scheme not found。
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project iDex.xcodeproj \
+            -target iDex \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS=""
+
+      - name: 打包成 .ipa
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/iDex.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::没找到编译产物 iDex.app，实际产物如下："
+            ls -R "$RUNNER_TEMP/dd/Build/Products" || true
+            exit 1
+          fi
+          rm -rf Payload iDex-unsigned.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry iDex-unsigned.ipa Payload
+          ls -lh iDex-unsigned.ipa
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: iDex-unsigned-ipa
+          path: iDex-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
